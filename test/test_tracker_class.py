@@ -684,6 +684,7 @@ class TestCreateSh(unittest.TestCase):
             }
         mock_response = Mock()
         mock_response.headers = headers
+        mock_response.status_code = 201
         mock_response.json.return_value = response_data
         mock_django_post.return_value = mock_response
 
@@ -774,6 +775,42 @@ class TestCreateSh(unittest.TestCase):
             self.assertIn("Tracker.create_sh(): d_client.create_sh() did not return a valid response", log.output[2])
             mock_django_post.assert_called_once_with(f"{API_INTERFACE}/sensorhardwares/", headers=self.tracker.d_client.auth_header, json=data)
             self.assertIsNone(sh_uid)
+
+    @patch("app.django_client.DjangoClient.get_sh")
+    def test_resolve_sh_id_found(self, mock_get_sh):
+        mock_get_sh.return_value = {"status_code": 200, "json_body": {"id": 42}}
+        sh_id = self.tracker.resolve_sh_id(self.mock_chirp_methods.get_device_profile_ret_val)
+        self.assertEqual(sh_id, 42)
+
+    @patch("app.tracker.tracker.Tracker.create_sh")
+    @patch("app.django_client.DjangoClient.get_sh")
+    def test_resolve_sh_id_creates_on_404(self, mock_get_sh, mock_create_sh):
+        mock_get_sh.return_value = {"status_code": 404, "json_body": None}
+        mock_create_sh.return_value = 99
+        sh_id = self.tracker.resolve_sh_id(self.mock_chirp_methods.get_device_profile_ret_val)
+        mock_create_sh.assert_called_once()
+        self.assertEqual(sh_id, 99)
+
+    @patch("app.django_client.DjangoClient.find_sh_id")
+    @patch("app.tracker.tracker.Tracker.create_sh")
+    @patch("app.django_client.DjangoClient.get_sh")
+    def test_resolve_sh_id_ambiguous_reuses_existing(self, mock_get_sh, mock_create_sh, mock_find_sh_id):
+        mock_get_sh.return_value = {"status_code": 500, "json_body": None}
+        mock_find_sh_id.return_value = 3
+        sh_id = self.tracker.resolve_sh_id(self.mock_chirp_methods.get_device_profile_ret_val)
+        mock_create_sh.assert_not_called()
+        mock_find_sh_id.assert_called_once()
+        self.assertEqual(sh_id, 3)
+
+    @patch("app.django_client.DjangoClient.find_sh_id")
+    @patch("app.tracker.tracker.Tracker.create_sh")
+    @patch("app.django_client.DjangoClient.get_sh")
+    def test_resolve_sh_id_create_fail_falls_back_to_list(self, mock_get_sh, mock_create_sh, mock_find_sh_id):
+        mock_get_sh.return_value = {"status_code": 404, "json_body": None}
+        mock_create_sh.return_value = None
+        mock_find_sh_id.return_value = 7
+        sh_id = self.tracker.resolve_sh_id(self.mock_chirp_methods.get_device_profile_ret_val)
+        self.assertEqual(sh_id, 7)
 
 class TestUpdateManifest(unittest.TestCase):
 
@@ -1136,7 +1173,8 @@ class TestOnMessage(unittest.TestCase):
         con_type = "OTAA" if self.mock_chirp_methods.get_device_profile_ret_val.device_profile.supports_otaa else "ABP"
         lw_v = self.mock_chirp_methods.get_device_profile_ret_val.device_profile.mac_version
         key_resp = self.tracker.c_client.get_device_app_key(deveui,lw_v)
-        mock_lc_str = "mock_lc_uid"
+        dev_name = replace_spaces(self.mock_chirp_methods.get_device_ret_val.device.name)
+        lc_str = f"{VSN}-{dev_name}-{deveui}"
         update_ld_data = {
             "name": replace_spaces(self.mock_chirp_methods.get_device_ret_val.device.name),
             "battery_level": self.mock_chirp_methods.get_device_ret_val.device_status.battery_level
@@ -1151,7 +1189,7 @@ class TestOnMessage(unittest.TestCase):
             "connection_type": con_type
         }
         create_lk_data = {
-            "lorawan_connection": mock_lc_str,
+            "lorawan_connection": lc_str,
             "network_Key": self.mock_chirp_methods.get_device_activation_ret_val.device_activation.nwk_s_enc_key,  
             "app_session_key": self.mock_chirp_methods.get_device_activation_ret_val.device_activation.app_s_key,
             "dev_address": self.mock_chirp_methods.get_device_activation_ret_val.device_activation.dev_addr,
@@ -1186,13 +1224,12 @@ class TestOnMessage(unittest.TestCase):
 
     @patch("app.django_client.HttpMethod.POST")
     @patch("app.django_client.DjangoClient.get_sh")
-    @patch("app.django_client.DjangoClient.sh_search")
     @patch("app.django_client.DjangoClient.ld_search")
     @patch('chirpstack_api_wrapper.api.DeviceProfileServiceStub')
     @patch('chirpstack_api_wrapper.api.DeviceServiceStub')
     @patch('app.manifest.Manifest.load_manifest')
     @patch('app.django_client.DjangoClient.lc_search')
-    def test_on_message_dev_not_exist_2(self, mock_lc_search, mock_load_manifest, mock_device_service_stub, mock_device_profile_service_stub, mock_ld_search, mock_sh_search, mock_get_sh, mock_django_post):
+    def test_on_message_dev_not_exist_2(self, mock_lc_search, mock_load_manifest, mock_device_service_stub, mock_device_profile_service_stub, mock_ld_search, mock_get_sh, mock_django_post):
         """
         Test on_message() happy path when device DOES NOT exist in the manifest and in django but sensor hardware exist in django
         """
@@ -1220,9 +1257,11 @@ class TestOnMessage(unittest.TestCase):
         mock_device_service_stub_instance.GetKeys.return_value = self.mock_chirp_methods.get_device_app_key_ret_val
         #   mock search return values
         mock_ld_search.return_value = False
-        mock_sh_search.return_value = True
-        #   mock django get sh return value
-        mock_get_sh.return_value = {'json_body':{"id": self.mock_chirp_methods.get_device_profile_ret_val.device_profile.id}}
+        #   mock django get sh return value (resolve_sh_id uses get_sh directly)
+        mock_get_sh.return_value = {
+            'status_code': 200,
+            'json_body': {"id": self.mock_chirp_methods.get_device_profile_ret_val.device_profile.id},
+        }
 
         #call the action in testing
         client = Mock()
@@ -1238,7 +1277,8 @@ class TestOnMessage(unittest.TestCase):
         con_type = "OTAA" if self.mock_chirp_methods.get_device_profile_ret_val.device_profile.supports_otaa else "ABP"
         lw_v = self.mock_chirp_methods.get_device_profile_ret_val.device_profile.mac_version
         key_resp = self.tracker.c_client.get_device_app_key(deveui,lw_v)
-        mock_lc_str = "mock_lc_uid"
+        dev_name = replace_spaces(self.mock_chirp_methods.get_device_ret_val.device.name)
+        lc_str = f"{VSN}-{dev_name}-{deveui}"
         create_ld_data = {
             "name": replace_spaces(self.mock_chirp_methods.get_device_ret_val.device.name),
             "battery_level": self.mock_chirp_methods.get_device_ret_val.device_status.battery_level,
@@ -1255,7 +1295,7 @@ class TestOnMessage(unittest.TestCase):
             "connection_type": con_type
         }
         create_lk_data = {
-            "lorawan_connection": mock_lc_str,
+            "lorawan_connection": lc_str,
             "network_Key": self.mock_chirp_methods.get_device_activation_ret_val.device_activation.nwk_s_enc_key,  
             "app_session_key": self.mock_chirp_methods.get_device_activation_ret_val.device_activation.app_s_key,
             "dev_address": self.mock_chirp_methods.get_device_activation_ret_val.device_activation.dev_addr,
@@ -1290,13 +1330,13 @@ class TestOnMessage(unittest.TestCase):
 
 
     @patch("app.django_client.HttpMethod.POST")
-    @patch("app.django_client.DjangoClient.sh_search")
+    @patch("app.django_client.DjangoClient.get_sh")
     @patch("app.django_client.DjangoClient.ld_search")
     @patch('chirpstack_api_wrapper.api.DeviceProfileServiceStub')
     @patch('chirpstack_api_wrapper.api.DeviceServiceStub')
     @patch('app.manifest.Manifest.load_manifest')
     @patch('app.django_client.DjangoClient.lc_search')
-    def test_on_message_dev_not_exist_3(self, mock_lc_search, mock_load_manifest, mock_device_service_stub, mock_device_profile_service_stub, mock_ld_search, mock_sh_search, mock_django_post):
+    def test_on_message_dev_not_exist_3(self, mock_lc_search, mock_load_manifest, mock_device_service_stub, mock_device_profile_service_stub, mock_ld_search, mock_get_sh, mock_django_post):
         """
         Test on_message() happy path when device DOES NOT exist in the manifest and in django and sensor hardware DOES NOT exist in django
         """
@@ -1324,7 +1364,22 @@ class TestOnMessage(unittest.TestCase):
         mock_device_service_stub_instance.GetKeys.return_value = self.mock_chirp_methods.get_device_app_key_ret_val
         #   mock search return values aka does not exist in django
         mock_ld_search.return_value = False
-        mock_sh_search.return_value = False
+        mock_get_sh.return_value = {'status_code': 404, 'json_body': None}
+        sh_id = self.mock_chirp_methods.get_device_profile_ret_val.device_profile.id
+        create_sh_response = Mock()
+        create_sh_response.headers = {'Content-Type': 'application/json'}
+        create_sh_response.status_code = 201
+        create_sh_response.json.return_value = {"id": sh_id}
+        create_other_response = Mock()
+        create_other_response.headers = {'Content-Type': 'application/json'}
+        create_other_response.status_code = 201
+        create_other_response.json.return_value = {"id": "mock_lc_uid"}
+        mock_django_post.side_effect = [
+            create_sh_response,
+            create_other_response,
+            create_other_response,
+            create_other_response,
+        ]
 
         #call the action in testing
         client = Mock()
@@ -1340,7 +1395,8 @@ class TestOnMessage(unittest.TestCase):
         con_type = "OTAA" if self.mock_chirp_methods.get_device_profile_ret_val.device_profile.supports_otaa else "ABP"
         lw_v = self.mock_chirp_methods.get_device_profile_ret_val.device_profile.mac_version
         key_resp = self.tracker.c_client.get_device_app_key(deveui,lw_v)
-        mock_lc_str = "mock_lc_uid"
+        dev_name = replace_spaces(self.mock_chirp_methods.get_device_ret_val.device.name)
+        lc_str = f"{VSN}-{dev_name}-{deveui}"
 
         create_sh_data = {
             "hardware": self.mock_chirp_methods.get_device_profile_ret_val.device_profile.name,
@@ -1364,7 +1420,7 @@ class TestOnMessage(unittest.TestCase):
             "connection_type": con_type
         }
         create_lk_data = {
-            "lorawan_connection": mock_lc_str,
+            "lorawan_connection": lc_str,
             "network_Key": self.mock_chirp_methods.get_device_activation_ret_val.device_activation.nwk_s_enc_key,  
             "app_session_key": self.mock_chirp_methods.get_device_activation_ret_val.device_activation.app_s_key,
             "dev_address": self.mock_chirp_methods.get_device_activation_ret_val.device_activation.dev_addr,

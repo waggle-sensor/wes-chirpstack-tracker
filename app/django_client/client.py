@@ -49,22 +49,13 @@ class DjangoClient:
         api_endpoint = f"{self.LC_ROUTER}{self.vsn}/{dev_eui}/"
         return  self.call_api(HttpMethod.PATCH, api_endpoint, data)
 
-    def lc_search(self, dev_eui: str) -> bool:
+    def lc_search(self, dev_eui: str):
         """
-        Search the db for a lorawan connection return true if found
+        Search the db for a lorawan connection.
+        Returns True if found, False if 404, None on ambiguous/error (do not create).
         """
         api_endpoint = f"{self.LC_ROUTER}{self.vsn}/{dev_eui}/"
-        response = self.call_api(HttpMethod.GET, api_endpoint)
-
-        if response['json_body']: #if json_body is not None (record found)...
-            return True
-        else:  #if json_body is None...
-            status_code = response['headers'].get('status-code')
-            if status_code == 404: #if not found...
-                return False
-            else: #if unknown status code...
-                logging.error(f"Unexpected status code in DjangoClient.lc_search() for {api_endpoint}: {status_code}")
-                return False
+        return self._search_result(self.call_api(HttpMethod.GET, api_endpoint), api_endpoint, "lc_search")
 
     def get_ld(self, dev_eui: str) -> dict:
         """
@@ -87,22 +78,13 @@ class DjangoClient:
         api_endpoint = f"{self.LD_ROUTER}{dev_eui}/"
         return  self.call_api(HttpMethod.PATCH, api_endpoint, data)
 
-    def ld_search(self, dev_eui: str) -> bool:
+    def ld_search(self, dev_eui: str):
         """
-        Search the db for a lorawan device return true if found
+        Search the db for a lorawan device.
+        Returns True if found, False if 404, None on ambiguous/error (do not create).
         """
         api_endpoint = f"{self.LD_ROUTER}{dev_eui}/"
-        response = self.call_api(HttpMethod.GET, api_endpoint)
-
-        if response['json_body']: #if json_body is not None (record found)...
-            return True
-        else:  #if json_body is None...
-            status_code = response['headers'].get('status-code')
-            if status_code == 404: #if not found...
-                return False
-            else: #if unknown status code...
-                logging.error(f"Unexpected status code in DjangoClient.ld_search() for {api_endpoint}: {status_code}")
-                return False
+        return self._search_result(self.call_api(HttpMethod.GET, api_endpoint), api_endpoint, "ld_search")
 
     def get_lk(self, dev_eui: str) -> dict:
         """
@@ -132,6 +114,13 @@ class DjangoClient:
         api_endpoint = f"{self.SH_ROUTER}{hw_model}/"
         return  self.call_api(HttpMethod.GET, api_endpoint)
 
+    def list_sh(self) -> dict:
+        """
+        List Sensor Hardware records
+        """
+        api_endpoint = f"{self.SH_ROUTER}"
+        return self.call_api(HttpMethod.GET, api_endpoint)
+
     def create_sh(self, data: dict) -> dict:
         """
         Create Sensor Hardware
@@ -146,22 +135,64 @@ class DjangoClient:
         api_endpoint = f"{self.SH_ROUTER}{hw_model}/"
         return self.call_api(HttpMethod.PATCH, api_endpoint, data)
 
-    def sh_search(self, hw_model: str) -> bool:
+    def sh_search(self, hw_model: str):
         """
-        Search the db for a sensor hardware return true if found
+        Search the db for a sensor hardware.
+        Returns True if found, False if 404, None on ambiguous/error (do not create).
         """
         api_endpoint = f"{self.SH_ROUTER}{hw_model}/"
-        response = self.call_api(HttpMethod.GET, api_endpoint)
+        return self._search_result(self.call_api(HttpMethod.GET, api_endpoint), api_endpoint, "sh_search")
 
-        if response['json_body']: #if json_body is not None (record found)...
+    def find_sh_id(self, hw_model: str):
+        """
+        Find an existing sensor hardware id by hw_model via list endpoint.
+        Prefer the lowest id (oldest / original) when duplicates exist.
+        Returns None if none found or list fails.
+        """
+        response = self.list_sh()
+        items = self._normalize_list_body(response.get("json_body"))
+        if items is None:
+            logging.error(f"DjangoClient.find_sh_id(): failed to list sensor hardware for hw_model={hw_model}")
+            return None
+
+        matches = [
+            item for item in items
+            if isinstance(item, dict)
+            and item.get("hw_model") == hw_model
+            and item.get("id") is not None
+        ]
+        if not matches:
+            return None
+        return min(matches, key=lambda item: item["id"])["id"]
+
+    def _normalize_list_body(self, body):
+        """Normalize DRF list/paginated responses into a list of records."""
+        if body is None:
+            return None
+        if isinstance(body, list):
+            return body
+        if isinstance(body, dict):
+            results = body.get("results")
+            if isinstance(results, list):
+                return results
+        return None
+
+    def _search_result(self, response: dict, api_endpoint: str, method_name: str):
+        """
+        Interpret a GET-by-lookup response.
+        True = found, False = confirmed missing (404), None = ambiguous/error.
+        """
+        if response.get("json_body"):
             return True
-        else:  #if json_body is None...
-            status_code = response['headers'].get('status-code')
-            if status_code == 404: #if not found...
-                return False
-            else: #if unknown status code...
-                logging.error(f"Unexpected status code in DjangoClient.sh_search() for {api_endpoint}: {status_code}")
-                return False
+
+        status_code = response.get("status_code")
+        if status_code == 404:
+            return False
+
+        logging.error(
+            f"Unexpected status code in DjangoClient.{method_name}() for {api_endpoint}: {status_code}"
+        )
+        return None
 
     def call_api(self, method: HttpMethod, endpoint: str, data: dict = None) -> dict:
         """
@@ -177,6 +208,7 @@ class DjangoClient:
 
             return {
                 'headers': dict(response.headers),
+                'status_code': response.status_code,
                 'json_body': response.json()
             }
         except requests.exceptions.HTTPError as e:
@@ -187,6 +219,7 @@ class DjangoClient:
                 logging.error(f"requests.exceptions.JSONDecodeError: {e}")
             return {
                 'headers': dict(response.headers),
+                'status_code': getattr(response, "status_code", None),
                 'json_body': None
             }
 

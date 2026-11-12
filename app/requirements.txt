@@ -1,4 +1,7 @@
 git+https://github.com/waggle-sensor/chirpstack_api_wrapper@0.1.0
+# wrapper allows chirpstack-api 4.*; 4.13+ needs protobuf 6+/7+ which breaks on python:3.8-slim
+chirpstack-api==4.12.1
+protobuf>=5.29.0,<6
 paho-mqtt==1.*
 requests
 pytz

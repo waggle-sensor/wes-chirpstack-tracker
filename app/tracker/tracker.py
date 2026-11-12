@@ -49,7 +49,13 @@ class Tracker(MqttClient):
         act_resp = self.c_client.get_device_activation(deviceInfo["devEui"])
 
         #check for lorawan connection in server
+        # lc/ld/sh search: True=found, False=404 missing, None=ambiguous/error (do not create)
         server_lc_exist = self.d_client.lc_search(deviceInfo["devEui"])
+        if server_lc_exist is None:
+            logging.error(
+                f"Tracker.on_message(): ambiguous lorawan connection lookup for {deviceInfo['devEui']}; skipping"
+            )
+            return
 
         #if lorawan connection exist in django then...
         if server_lc_exist:
@@ -59,26 +65,25 @@ class Tracker(MqttClient):
             self.update_lk(deviceInfo["devEui"], act_resp, deviceprofile_resp)
         else:
             #if lorawan device exist in django then...
-            if self.d_client.ld_search(deviceInfo["devEui"]):
+            ld_exist = self.d_client.ld_search(deviceInfo["devEui"])
+            if ld_exist is None:
+                logging.error(
+                    f"Tracker.on_message(): ambiguous lorawan device lookup for {deviceInfo['devEui']}; skipping"
+                )
+                return
+            if ld_exist:
                 # update lorawan device
                 self.update_ld(deviceInfo["devEui"], device_resp) 
             #else lorawan device does not exist in django then...
             else:
-                #TODO: What is a better way to check if sensor hardware exists? 
-                #   - whats a GUID for sensor hardwares that is shared throughout waggle that also does not change
-                #   - hw_model will change since we will update it.
-                #       - right now hw_model is filled as best as the tracker can
-                #       - since we will change it, duplicates will be created
-                hw_model = clean_hw_model(deviceprofile_resp.device_profile.name)
-                # if sensor hardware exist in django then...
-                if self.d_client.sh_search(hw_model):
-                    # get sensor hardware from django
-                    response = self.d_client.get_sh(hw_model)
-                    sh_id = response['json_body'].get('id')
-                #else sensor hardware does not exist in django then...
-                else:
-                    # create a new sensor hardware
-                    sh_id = self.create_sh(deviceprofile_resp)
+                # Resolve existing SH (including duplicate hw_model fallback) before creating.
+                # hw_model is not a stable unique key in Django; never create on ambiguous lookup.
+                sh_id = self.resolve_sh_id(deviceprofile_resp)
+                if sh_id is None:
+                    logging.error(
+                        f"Tracker.on_message(): could not resolve sensor hardware for {deviceInfo['devEui']}; skipping create"
+                    )
+                    return
                 # create a new lorawan device
                 self.create_ld(deviceInfo["devEui"], sh_id, device_resp)
 
@@ -223,6 +228,38 @@ class Tracker(MqttClient):
         self.d_client.create_lk(lk_data)
 
         return
+
+    def resolve_sh_id(self, deviceprofile_resp: dict):
+        """
+        Resolve sensor hardware id for a device profile.
+        - Use existing record when GET by hw_model succeeds
+        - Create only on confirmed 404
+        - On ambiguous GET (e.g. duplicate hw_model → 500), list and reuse lowest id
+        - Never create when lookup is ambiguous, to avoid orphan duplicates
+        """
+        hw_model = clean_hw_model(deviceprofile_resp.device_profile.name)
+        response = self.d_client.get_sh(hw_model)
+        body = response.get("json_body")
+        if isinstance(body, dict) and body.get("id") is not None:
+            return body["id"]
+
+        status_code = response.get("status_code")
+        if status_code == 404:
+            sh_id = self.create_sh(deviceprofile_resp)
+            if sh_id is not None:
+                return sh_id
+            # create raced/failed; reuse any existing row instead of creating another
+            logging.warning(
+                f"Tracker.resolve_sh_id(): create failed for hw_model={hw_model}; falling back to list"
+            )
+            return self.d_client.find_sh_id(hw_model)
+
+        # Ambiguous/error (common when hw_model is not unique): reuse oldest match, do not create
+        logging.error(
+            f"Tracker.resolve_sh_id(): ambiguous sensor hardware lookup for hw_model={hw_model} "
+            f"(status={status_code}); reusing existing record if found"
+        )
+        return self.d_client.find_sh_id(hw_model)
 
     #TODO: consider using Tanuki to fill out fields like description, manufacturer, etc. in sensor hardware
     def create_sh(self, deviceprofile_resp: dict) -> int:
