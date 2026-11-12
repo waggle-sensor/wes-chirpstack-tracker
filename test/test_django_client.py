@@ -363,10 +363,10 @@ class TestDjangoClient(unittest.TestCase):
         mock_response = Mock()
         headers = {
             'Content-Type': 'application/json', 
-            'status-code': 200,
             'Custom-Header': 'Mocked-Value',
         }
         mock_response.headers = headers
+        mock_response.status_code = 200
         mock_response.json.return_value = {"deveui":"123456789","device_name":"test","battery_level":"0.01"}
         mock_get.return_value = mock_response
 
@@ -385,11 +385,12 @@ class TestDjangoClient(unittest.TestCase):
         mock_response = Mock()
         headers = {
             'Content-Type': 'application/json', 
-            'status-code': 404,
             'Custom-Header': 'Mocked-Value',
         }
         mock_response.headers = headers
-        mock_response.json.return_value = {}
+        mock_response.status_code = 404
+        mock_response.json.return_value = {"detail": "not found"}
+        mock_response.raise_for_status.side_effect = requests.exceptions.HTTPError("not found")
         mock_get.return_value = mock_response
 
         # Call the method under test
@@ -407,11 +408,12 @@ class TestDjangoClient(unittest.TestCase):
         mock_response = Mock()
         headers = {
             'Content-Type': 'application/json', 
-            'status-code': 500,
             'Custom-Header': 'Mocked-Value',
         }
         mock_response.headers = headers
+        mock_response.status_code = 500
         mock_response.json.return_value = {}
+        mock_response.raise_for_status.side_effect = requests.exceptions.HTTPError("HTTP error")
         mock_get.return_value = mock_response
 
         # Call the method under test
@@ -419,7 +421,7 @@ class TestDjangoClient(unittest.TestCase):
 
         # Assertions
         mock_get.assert_called_once_with(f"{API_INTERFACE}/lorawandevices/{DEV_EUI}/", headers=self.django_client.auth_header)
-        self.assertFalse(result)
+        self.assertIsNone(result)
 
     @patch("app.django_client.DjangoClient.call_api")
     def test_ld_search_No_response(self, mock_call_api):
@@ -429,9 +431,9 @@ class TestDjangoClient(unittest.TestCase):
         mock_call_api.return_value = {
                 'headers': {
                     'Content-Type': 'application/json', 
-                    'status-code': 500,
                     'Custom-Header': 'Mocked-Value',
                 },
+                'status_code': 500,
                 'json_body': None
             }
 
@@ -439,7 +441,7 @@ class TestDjangoClient(unittest.TestCase):
         result = self.django_client.ld_search(dev_eui=DEV_EUI)
 
         # Assertions
-        self.assertFalse(result)
+        self.assertIsNone(result)
 
     @patch("app.django_client.HttpMethod.GET")
     def test_sh_search_found_happy_path(self, mock_get):
@@ -449,10 +451,10 @@ class TestDjangoClient(unittest.TestCase):
         mock_response = Mock()
         headers = {
             'Content-Type': 'application/json', 
-            'status-code': 200,
             'Custom-Header': 'Mocked-Value',
         }
         mock_response.headers = headers
+        mock_response.status_code = 200
         mock_response.json.return_value = {"hardware": "test","hw_model": HW_MODEL, "description": "test"}
         mock_get.return_value = mock_response
 
@@ -471,10 +473,10 @@ class TestDjangoClient(unittest.TestCase):
         mock_response = Mock()
         headers = {
             'Content-Type': 'application/json', 
-            'status-code': 404,
             'Custom-Header': 'Mocked-Value',
         }
         mock_response.headers = headers
+        mock_response.status_code = 404
         mock_response.json.return_value = {"detail":"not found"}
         mock_response.raise_for_status.side_effect = requests.exceptions.HTTPError("not found")
         mock_get.return_value = mock_response
@@ -494,10 +496,10 @@ class TestDjangoClient(unittest.TestCase):
         mock_response = Mock()
         headers = {
             'Content-Type': 'application/json', 
-            'status-code': 500,
             'Custom-Header': 'Mocked-Value',
         }
         mock_response.headers = headers
+        mock_response.status_code = 500
         mock_response.raise_for_status.side_effect = requests.exceptions.HTTPError("HTTP error")
         mock_get.return_value = mock_response
 
@@ -506,7 +508,7 @@ class TestDjangoClient(unittest.TestCase):
 
         # Assertions
         mock_get.assert_called_once_with(f"{API_INTERFACE}/sensorhardwares/{HW_MODEL}/", headers=self.django_client.auth_header)
-        self.assertFalse(result)
+        self.assertIsNone(result)
 
     @patch("app.django_client.DjangoClient.call_api")
     def test_sh_search_No_response(self, mock_call_api):
@@ -516,9 +518,9 @@ class TestDjangoClient(unittest.TestCase):
         mock_call_api.return_value = {
             'headers': {
                 'Content-Type': 'application/json', 
-                'status-code': 500,
                 'Custom-Header': 'Mocked-Value',
         },
+            'status_code': 500,
             'json_body': None
         }
 
@@ -526,7 +528,58 @@ class TestDjangoClient(unittest.TestCase):
         result = self.django_client.sh_search(hw_model=HW_MODEL)
 
         # Assertions
-        self.assertFalse(result)
+        self.assertIsNone(result)
+
+    @patch("app.django_client.DjangoClient.call_api")
+    def test_find_sh_id_prefers_lowest_id(self, mock_call_api):
+        """
+        find_sh_id should reuse the oldest matching sensor hardware when duplicates exist
+        """
+        mock_call_api.return_value = {
+            "headers": {},
+            "status_code": 200,
+            "json_body": [
+                {"id": 12, "hw_model": HW_MODEL},
+                {"id": 3, "hw_model": HW_MODEL},
+                {"id": 7, "hw_model": "other"},
+            ],
+        }
+
+        result = self.django_client.find_sh_id(HW_MODEL)
+
+        mock_call_api.assert_called_once_with(HttpMethod.GET, SH_ROUTER)
+        self.assertEqual(result, 3)
+
+    @patch("app.django_client.DjangoClient.call_api")
+    def test_find_sh_id_paginated_results(self, mock_call_api):
+        """
+        find_sh_id should support DRF paginated list responses
+        """
+        mock_call_api.return_value = {
+            "headers": {},
+            "status_code": 200,
+            "json_body": {
+                "count": 2,
+                "results": [
+                    {"id": 9, "hw_model": HW_MODEL},
+                    {"id": 2, "hw_model": HW_MODEL},
+                ],
+            },
+        }
+
+        result = self.django_client.find_sh_id(HW_MODEL)
+        self.assertEqual(result, 2)
+
+    @patch("app.django_client.DjangoClient.call_api")
+    def test_find_sh_id_not_found(self, mock_call_api):
+        mock_call_api.return_value = {
+            "headers": {},
+            "status_code": 200,
+            "json_body": [{"id": 1, "hw_model": "other"}],
+        }
+
+        result = self.django_client.find_sh_id(HW_MODEL)
+        self.assertIsNone(result)
 
     @patch("app.django_client.HttpMethod.GET")
     def test_lc_search_found_happy_path(self, mock_get):
@@ -536,10 +589,10 @@ class TestDjangoClient(unittest.TestCase):
         mock_response = Mock()
         headers = {
             'Content-Type': 'application/json', 
-            'status-code': 200,
             'Custom-Header': 'Mocked-Value',
         }
         mock_response.headers = headers
+        mock_response.status_code = 200
         mock_response.json.return_value = {"connection_name": "test","margin": 2, "connection_type": "OTAA"}
         mock_get.return_value = mock_response
 
@@ -559,10 +612,10 @@ class TestDjangoClient(unittest.TestCase):
         mock_response = Mock()
         headers = {
             'Content-Type': 'application/json', 
-            'status-code': 404,
             'Custom-Header': 'Mocked-Value',
         }
         mock_response.headers = headers
+        mock_response.status_code = 404
         mock_response.json.return_value = {"detail":"not found"}
         mock_response.raise_for_status.side_effect = requests.exceptions.HTTPError("not found")
         mock_get.return_value = mock_response
@@ -582,10 +635,10 @@ class TestDjangoClient(unittest.TestCase):
         mock_response = Mock()
         headers = {
             'Content-Type': 'application/json', 
-            'status-code': 500,
             'Custom-Header': 'Mocked-Value',
         }
         mock_response.headers = headers
+        mock_response.status_code = 500
         mock_response.raise_for_status.side_effect = requests.exceptions.HTTPError("HTTP error")
         mock_get.return_value = mock_response
 
@@ -594,7 +647,7 @@ class TestDjangoClient(unittest.TestCase):
 
         # Assertions
         mock_get.assert_called_once_with(f"{API_INTERFACE}/lorawanconnections/{VSN}/{DEV_EUI}/", headers=self.django_client.auth_header)
-        self.assertFalse(result)
+        self.assertIsNone(result)
 
     @patch("app.django_client.DjangoClient.call_api")
     def test_lc_search_No_response(self, mock_call_api):
@@ -604,9 +657,9 @@ class TestDjangoClient(unittest.TestCase):
         mock_call_api.return_value = {
             'headers': {
                 'Content-Type': 'application/json', 
-                'status-code': 500,
                 'Custom-Header': 'Mocked-Value',
         },
+            'status_code': 500,
             'json_body': None
         }
 
@@ -614,7 +667,7 @@ class TestDjangoClient(unittest.TestCase):
         result = self.django_client.lc_search(dev_eui=DEV_EUI)
 
         # Assertions
-        self.assertFalse(result)
+        self.assertIsNone(result)
 
     @patch("app.django_client.HttpMethod.GET")
     def test_call_api_sad_path(self, mock_get):
@@ -624,9 +677,9 @@ class TestDjangoClient(unittest.TestCase):
         mock_response = Mock()
         mock_response.headers = {
                 'Content-Type': 'application/json', 
-                'status-code': 500,
                 'Custom-Header': 'Mocked-Value',
         }
+        mock_response.status_code = 500
         mock_response.raise_for_status.side_effect = requests.exceptions.HTTPError("HTTP Error")
         mock_get.return_value = mock_response
 
@@ -638,6 +691,7 @@ class TestDjangoClient(unittest.TestCase):
 
         # Assert
         self.assertIsNone(result['json_body'])
+        self.assertEqual(result['status_code'], 500)
 
 
 if __name__ == "__main__":
